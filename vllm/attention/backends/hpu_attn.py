@@ -122,6 +122,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             alibi_slopes_tensor = torch.tensor(alibi_slopes,
                                                dtype=torch.bfloat16)
             self.alibi_slopes = alibi_slopes_tensor
+        self.max_seq_len = max_seq_len
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
@@ -200,11 +201,15 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                             'attn_bias must be set before calling model.forward'
                     attn_bias = attn_metadata.attn_bias
                     if self.alibi_slopes is not None:
-                        position_bias = _make_alibi_bias(
-                            self.alibi_slopes, self.num_kv_heads,
-                            attn_bias.dtype, attn_bias.shape[-1])
+                        position_bias = _make_prompt_alibi_bias(
+                            self.alibi_slopes,
+                            self.num_kv_heads,
+                            self.alibi_slopes.dtype,
+                            attn_bias.shape[-1],
+                        )
                         attn_bias = attn_bias.tile(
-                            (1, self.num_kv_heads, 1, 1))
+                            (1, self.num_kv_heads, 1, 1)
+                        )
                         attn_bias.add_(position_bias)
                 else:
                     attn_bias = None
@@ -239,6 +244,16 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
             # Decoding run.
+            self.position_bias = None
+            attn_bias = attn_metadata.attn_bias
+            if self.alibi_slopes is not None:
+                self.position_bias = _make_decode_alibi_bias(
+                    attn_metadata.alibi_blocks,
+                    self.alibi_slopes,
+                    self.num_kv_heads,
+                    self.alibi_slopes.dtype,
+                )
+
             output = HPUPagedAttention.forward_decode(
                 query=query,
                 key_cache=key_cache,
@@ -249,15 +264,19 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 block_scales=attn_metadata.block_scales,
                 block_groups=attn_metadata.block_groups,
                 scale=self.scale,
+                alibi_slopes=self.position_bias,
                 matmul_qk_op=self.matmul_qk,
                 matmul_av_op=self.matmul_av,
                 keys_fetch_func=self.k_cache.fetch_from_cache,
-                values_fetch_func=self.v_cache.fetch_from_cache)
+                values_fetch_func=self.v_cache.fetch_from_cache,
+            )
+
         # Reshape the output tensor.
-        return output.view(batch_size, seq_len, hidden_size)
+        output = output.view(batch_size, seq_len, hidden_size)
+        return output
 
 
-def _make_alibi_bias(
+def _make_prompt_alibi_bias(
     alibi_slopes: torch.Tensor,
     num_kv_heads: int,
     dtype: torch.dtype,
@@ -275,15 +294,42 @@ def _make_alibi_bias(
 
     padded_len = (seq_len + 7) // 8 * 8
     num_heads = alibi_slopes.shape[0]
-    bias = torch.empty(
-        1,  # batch size
+    per_head_bias = torch.empty(
+        1,
         num_heads,
         seq_len,
         padded_len,
         device=alibi_slopes.device,
         dtype=dtype,
-    )[:, :, :, :seq_len].copy_(bias)
-    bias.mul_(alibi_slopes[:, None, None])
+    )[:, :, :, :seq_len]
+    # NOTE(Tanner):
+    # .copy_ was not performing broadcasting of bias to all 32 heads in Eager mode.
+    per_head_bias[:, :] = bias
+    per_head_bias.mul_(alibi_slopes[:, None, None])
     if num_heads != num_kv_heads:
-        bias = bias.unflatten(1, (num_kv_heads, num_heads // num_kv_heads))
-    return bias
+        per_head_bias = per_head_bias.unflatten(1, (num_kv_heads, num_heads // num_kv_heads))
+
+    return per_head_bias
+
+
+def _make_decode_alibi_bias(
+    alibi_blocks: torch.Tensor, 
+    alibi_slopes: torch.Tensor,
+    num_kv_heads: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    num_heads = alibi_slopes.shape[0]
+    per_head_bias = torch.empty(
+        alibi_blocks.size(0),  # num blocks
+        num_heads,
+        alibi_blocks.size(-1),
+        device=alibi_slopes.device,
+        dtype=dtype,
+    )
+    # NOTE(Tanner):
+    # .copy_ was not performing broadcasting of bias to all 32 heads in Eager mode.
+    per_head_bias[:, :] = alibi_blocks.unsqueeze(-2)
+    per_head_bias.mul_(alibi_slopes[None, :, None])
+    if num_heads != num_kv_heads:
+        per_head_bias = per_head_bias.unflatten(1, (num_kv_heads, num_heads // num_kv_heads))
+    return per_head_bias
