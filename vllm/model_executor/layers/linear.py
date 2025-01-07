@@ -1,3 +1,4 @@
+import os
 from abc import abstractmethod
 from typing import Dict, List, Optional, Tuple
 
@@ -27,7 +28,8 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "AWQLinearMethod", "GPTQMarlinLinearMethod", "Fp8LinearMethod",
     "MarlinLinearMethod", "QQQLinearMethod", "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod", "GPTQLinearMethod", "FBGEMMFp8LinearMethod",
-    "ModelOptFp8LinearMethod", "IPEXAWQLinearMethod"
+    "ModelOptFp8LinearMethod", "IPEXAWQLinearMethod", "AWQHPULinearMethod",
+    "GPTQHPULinearMethod"
 ]
 
 
@@ -126,13 +128,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        # WA for CS-747
+        self.bias_add_fp32 = os.environ.get('VLLM_BIAS_ADD_FP32',
+                                            'false').lower() == 'true'
 
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        return F.linear(x, layer.weight, bias)
+        if self.bias_add_fp32 and bias is not None:
+            out = torch.matmul(x, layer.weight.transpose(
+                -2, -1)).float() + bias.float()
+        else:
+            out = F.linear(x, layer.weight, bias)
+        return out
 
 
 class LinearBase(torch.nn.Module):

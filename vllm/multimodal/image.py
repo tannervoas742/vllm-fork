@@ -84,3 +84,60 @@ class ImagePlugin(MultiModalPlugin):
 
     def _default_max_multimodal_tokens(self, ctx: InputContext) -> int:
         return 3000
+
+
+class ImageIdxPlugin(MultiModalPlugin):
+    """Plugin for image positions."""
+
+    def get_data_key(self) -> str:
+        return "img_idx"
+
+    def _default_input_mapper(
+        self,
+        ctx: InputContext,
+        data: MultiModalData[Any],
+        **mm_processor_kwargs,
+    ) -> MultiModalKwargs:
+        img_idx = data
+        return MultiModalKwargs({"img_idx": img_idx})
+
+    def _default_max_multimodal_tokens(self, ctx: InputContext) -> int:
+        return 3000
+
+
+class PixelValuesPlugin(MultiModalPlugin):
+    """Plugin for pixel values."""
+
+    def get_data_key(self) -> str:
+        return "pixel_values"
+
+    def _default_input_mapper(
+        self,
+        ctx: InputContext,
+        data: MultiModalData[Any],
+        **mm_processor_kwargs,
+    ) -> MultiModalKwargs:
+        pixel_values = data
+        return MultiModalKwargs({"pixel_values": pixel_values})
+
+    def _default_max_multimodal_tokens(self, ctx: InputContext) -> int:
+        return 3000
+
+
+class InputImgPositionsPlugin(MultiModalPlugin):
+    """Plugin for image positions."""
+
+    def get_data_key(self) -> str:
+        return "img_position_ids"
+
+    def _default_input_mapper(
+        self,
+        ctx: InputContext,
+        data: MultiModalData[Any],
+        **mm_processor_kwargs,
+    ) -> MultiModalKwargs:
+        input_positions = data
+        return MultiModalKwargs({"img_position_ids": input_positions})
+
+    def _default_max_multimodal_tokens(self, ctx: InputContext) -> int:
+        return 3000

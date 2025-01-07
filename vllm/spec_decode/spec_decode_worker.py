@@ -56,6 +56,10 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
     speculative_config: SpeculativeConfig = vllm_config.speculative_config
     assert speculative_config is not None
 
+    if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        raise NotImplementedError("Speculative decoding is currently "
+                                  "incompatible with pipeline parallelism")
+
     draft_worker_kwargs = kwargs.copy()
 
     kwargs["model_runner_cls"] = TargetModelRunner
@@ -418,6 +422,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             broadcast_tensor_dict({}, src=0)
             return []
 
+        from vllm import debug_store
+        debug_store.get("per_batch_info")[-1]["per_step_info"] += [-1]
+
         self._track_finished_requests(execute_model_req)
         disable_all_speculation = self._should_disable_all_speculation(
             execute_model_req)
@@ -698,6 +705,19 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             # Generate proposals using draft worker.
             proposals = self.proposer_worker.get_spec_proposals(
                 execute_model_req, self._seq_with_bonus_token_in_last_step)
+
+        from vllm import debug_store
+        fallback_non_spec = any([proposal_len == 0 for proposal_len in proposals.proposal_lens])
+        if fallback_non_spec:
+            # NOTE(Tanner): The current code doesnt support batches where
+            #               some items in a batch has speculative tokens
+            #               and others do not. Thus, we must run with no
+            #               speculative decoding if any have no tokens.
+            debug_store.get("per_batch_info")[-1]["per_step_info"][-1] = 0
+            return self._run_no_spec(execute_model_req,
+                                     skip_proposer=False)
+
+        debug_store.get("per_batch_info")[-1]["per_step_info"][-1] = 1
 
         if not self._allow_zero_draft_token_step and proposals.no_proposals:
             #TODO: Fix it #5814

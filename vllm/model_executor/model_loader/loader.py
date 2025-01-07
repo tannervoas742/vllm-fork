@@ -123,6 +123,8 @@ def _initialize_model(vllm_config: VllmConfig, prefix: str = "") -> nn.Module:
         kwargs["lora_config"] = vllm_config.lora_config
     if "scheduler_config" in all_params:
         kwargs["scheduler_config"] = vllm_config.scheduler_config
+    if "vllm_config" in all_params:
+        kwargs["vllm_config"] = vllm_config
     with set_current_vllm_config(vllm_config):
         return model_class(**kwargs)
 

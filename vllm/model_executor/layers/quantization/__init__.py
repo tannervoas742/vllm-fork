@@ -2,6 +2,7 @@ from typing import Dict, Type
 
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
+from vllm.model_executor.layers.quantization.awq_hpu import AWQHPUConfig
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -17,6 +18,7 @@ from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+from vllm.model_executor.layers.quantization.gptq_hpu import GPTQHPUConfig
 from vllm.model_executor.layers.quantization.gptq_marlin import (
     GPTQMarlinConfig)
 from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
@@ -33,6 +35,7 @@ from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
     "awq": AWQConfig,
+    "awq_hpu": AWQHPUConfig,
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
     "fp8": Fp8Config,
@@ -46,6 +49,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "gptq_marlin": GPTQMarlinConfig,
     "awq_marlin": AWQMarlinConfig,
     "gptq": GPTQConfig,
+    "gptq_hpu": GPTQHPUConfig,
     "compressed-tensors": CompressedTensorsConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "inc": INCConfig,

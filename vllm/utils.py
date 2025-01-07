@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import atexit
 import contextlib
 import datetime
 import enum
@@ -33,6 +34,9 @@ import psutil
 import torch
 import torch.types
 import yaml
+from habana_frameworks.mediapipe import fn
+from habana_frameworks.mediapipe.media_types import dtype, ftype, imgtype
+from habana_frameworks.mediapipe.mediapipe import MediaPipe
 from packaging.version import Version
 from torch.library import Library
 from typing_extensions import ParamSpec, TypeIs, assert_never
@@ -1659,3 +1663,72 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
+
+
+class NextGptMediaPipe(MediaPipe):
+    """
+    Class defining nextGPT Vision media pipe
+    """
+
+    def __init__(self,
+                 batch_size,
+                 media_queue,
+                 res,
+                 queue_depth=0,
+                 device="legacy",
+                 num_thread=1):
+
+        assert queue_depth == 0, "queue depth 0 expected"
+        assert device == "legacy", "legacy device only supported"
+
+        self.batch_size = batch_size
+        self.queue_depth = queue_depth
+
+        RGB_MEAN_VALUES = [0.48145466, 0.4578275, 0.40821073]
+        RGB_STD_VALUES = [0.26862954, 0.2613025, 0.27577711]
+        RGB_MULTIPLIER = 255
+
+        super().__init__(device=device,
+                         prefetch_depth=self.queue_depth,
+                         batch_size=self.batch_size,
+                         num_threads=num_thread,
+                         pipe_name=self.__class__.__name__)
+
+        self.input = fn.ReadMediaDatasetFromExt(ext_queue=media_queue)
+
+        self.decode = fn.ImageDecoder(
+            output_format=imgtype.RGB_P,
+            resize=[res, res],
+            resampling_mode=ftype.BICUBIC,
+        )
+
+        normalized_mean = np.array(
+            [m * RGB_MULTIPLIER for m in RGB_MEAN_VALUES], dtype=np.float32)
+        normalized_std = np.array(
+            [1 / (s * RGB_MULTIPLIER) for s in RGB_STD_VALUES],
+            dtype=np.float32)
+
+        self.norm_mean = fn.MediaConst(data=normalized_mean,
+                                       shape=[1, 1, normalized_mean.size],
+                                       dtype=dtype.FLOAT32,
+                                       device='cpu')
+        self.norm_std = fn.MediaConst(data=normalized_std,
+                                      shape=[1, 1, normalized_std.size],
+                                      dtype=dtype.FLOAT32,
+                                      device='cpu')
+        self.cmn = fn.CropMirrorNorm(crop_w=res,
+                                     crop_h=res,
+                                     crop_d=0,
+                                     dtype=dtype.FLOAT32)
+
+        atexit.register(MediaPipe.del_iter, self)
+
+    def definegraph(self):
+        files = self.input()
+        image = self.decode(files)  # WHCN
+
+        mean = self.norm_mean()
+        std = self.norm_std()
+        image = self.cmn(image, mean, std)
+
+        return image

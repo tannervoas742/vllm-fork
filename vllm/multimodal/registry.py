@@ -12,7 +12,8 @@ from vllm.transformers_utils.tokenizer import AnyTokenizer
 
 from .audio import AudioPlugin
 from .base import MultiModalInputMapper, MultiModalPlugin, MultiModalTokensCalc
-from .image import ImagePlugin
+from .image import (ImageIdxPlugin, ImagePlugin, InputImgPositionsPlugin,
+                    PixelValuesPlugin)
 from .inputs import MultiModalDataDict, MultiModalKwargs, NestedTensors
 from .processing import MultiModalProcessor
 from .video import VideoPlugin
@@ -54,7 +55,9 @@ class MultiModalRegistry:
     :class:`~vllm.multimodal.MultiModalPlugin` for each modality.
     """
 
-    DEFAULT_PLUGINS = (ImagePlugin(), AudioPlugin(), VideoPlugin())
+    DEFAULT_PLUGINS = (ImagePlugin(), AudioPlugin(), VideoPlugin(),
+                       ImageIdxPlugin(), InputImgPositionsPlugin(),
+                       PixelValuesPlugin())
 
     def __init__(
             self,

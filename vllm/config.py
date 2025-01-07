@@ -1,13 +1,17 @@
 import copy
 import enum
 import json
+import os
 import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from queue import Queue
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Final, List,
                     Literal, Mapping, Optional, Set, Tuple, Type, Union)
 
 import torch
+from habana_frameworks.mediapipe.plugins.iterator_pytorch import (
+    NextGptPytorchIterator)
 from pydantic import BaseModel, Field, PrivateAttr
 from transformers import PretrainedConfig
 
@@ -21,8 +25,9 @@ from vllm.transformers_utils.config import (
     ConfigFormat, get_config, get_hf_image_processor_config,
     get_hf_text_config, get_pooling_config,
     get_sentence_transformer_tokenizer_config, is_encoder_decoder, uses_mrope)
-from vllm.utils import (GiB_bytes, cuda_device_count_stateless, get_cpu_memory,
-                        identity, print_warning_once, resolve_obj_by_qualname)
+from vllm.utils import (GiB_bytes, NextGptMediaPipe,
+                        cuda_device_count_stateless, get_cpu_memory, identity,
+                        print_warning_once, resolve_obj_by_qualname)
 
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
@@ -218,6 +223,19 @@ class ModelConfig:
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
         self.use_async_output_proc = use_async_output_proc
         self.mm_processor_kwargs = mm_processor_kwargs
+
+        # Init mediapipe if use hpu media
+        if os.environ.get('USE_HPU_MEDIA', 'false').lower() == 'true':
+            self.media_queue: Queue[str] = Queue()
+            image_size = self.hf_config.visual["image_size"]
+            mediapipe = NextGptMediaPipe(batch_size=1,
+                                         media_queue=self.media_queue,
+                                         res=image_size,
+                                         queue_depth=0,
+                                         device="legacy")
+            iterator = NextGptPytorchIterator(mediapipe=mediapipe)
+            self.media_iter = iter(iterator)
+            logger.info("Using HPU MediaPipe for Jpeg decode and resize.")
 
         # Set enforce_eager to False if the value is unset.
         if self.enforce_eager is None:
