@@ -90,6 +90,8 @@ _TEXT_GENERATION_MODELS = {
     "Starcoder2ForCausalLM": ("starcoder2", "Starcoder2ForCausalLM"),
     "SolarForCausalLM": ("solar", "SolarForCausalLM"),
     "XverseForCausalLM": ("xverse", "XverseForCausalLM"),
+    "WeLMMoeForCausalLM": ("welm_moe", "WeLMMoeForCausalLM"),
+    "WeLMV3ForCausalLM": ("welmv3", "WeLMV3ForCausalLM"),
     # [Encoder-decoder]
     "BartModel": ("bart", "BartForConditionalGeneration"),
     "BartForConditionalGeneration": ("bart", "BartForConditionalGeneration"),

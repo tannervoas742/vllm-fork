@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/THUDM/GLM-4
 """Inference-only ChatGLM model compatible with THUDM weights."""
+import os
 from argparse import Namespace
 from array import array
 from typing import (Dict, Iterable, List, Mapping, Optional, Set, Tuple,
@@ -34,15 +35,17 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalData, MultiModalKwargs
 from vllm.multimodal.utils import cached_get_tokenizer
+from vllm.platforms import current_platform
 from vllm.sequence import (VLLM_TOKEN_ID_ARRAY_TYPE, IntermediateTensors,
                            SequenceData)
 from vllm.transformers_utils.configs import ChatGLMConfig
 
 from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsPP
-from .utils import (is_pp_missing_parameter,
+from .utils import (get_input_mask, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+is_hpu = current_platform.is_hpu()
 logger = init_logger(__name__)
 
 
@@ -231,6 +234,8 @@ class GLMAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
+        self.enable_zero_padding = os.environ.get('VLLM_ZERO_PADDING',
+                                                  'false').lower() == 'true'
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -293,6 +298,11 @@ class GLMAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        if (is_hpu and self.enable_zero_padding
+                and attn_metadata.seq_lens_tensor is not None):
+            valid_len = attn_metadata.seq_lens_tensor
+            mask = get_input_mask(hidden_states, valid_len)
+            hidden_states = hidden_states * mask.unsqueeze(-1)
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
@@ -303,6 +313,9 @@ class GLMAttention(nn.Module):
             kv_cache,
             attn_metadata,
         )
+        if (is_hpu and self.enable_zero_padding
+                and attn_metadata.seq_lens_tensor is not None):
+            context_layer = context_layer * mask.unsqueeze(-1)
         attn_output, _ = self.dense(context_layer)
         return attn_output
 
@@ -437,6 +450,9 @@ class GLMTransformer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.enable_zero_padding = os.environ.get('VLLM_ZERO_PADDING',
+                                                  'false').lower() == 'true'
+
         self.post_layer_norm = config.post_layer_norm
 
         # Number of layers.
@@ -466,6 +482,11 @@ class GLMTransformer(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        if (is_hpu and self.enable_zero_padding
+                and attn_metadata.seq_lens_tensor is not None):
+            valid_len = attn_metadata.seq_lens_tensor
+            mask = get_input_mask(hidden_states, valid_len)
+            hidden_states = hidden_states * mask.unsqueeze(-1)
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(

@@ -624,3 +624,18 @@ def maybe_prefix(prefix: str, name: str) -> str:
         The string "prefix.name" if prefix was non-empty, otherwise just "name".
     """
     return name if not prefix else f"{prefix}.{name}"
+
+
+def get_input_mask(hidden_states: torch.Tensor,
+                   valid_len: torch.Tensor) -> torch.Tensor:
+    """
+    Get input tensor's mask which are zeros for all padding data,
+    ones for valid tokens
+    """
+    # input_ids: (B, T, H), valid_len: (B)
+    seq_len = hidden_states.shape[1]
+    mask = torch.arange(seq_len).expand(len(valid_len),
+                                        seq_len) < valid_len.unsqueeze(1)
+    # mask: (B, T)
+    mask = mask.to(hidden_states.dtype)
+    return mask

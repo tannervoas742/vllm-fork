@@ -44,6 +44,7 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
 from vllm.multimodal.utils import cached_get_tokenizer
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors, SequenceData
 from vllm.utils import is_list_of
 
@@ -51,6 +52,8 @@ from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsPP
 from .utils import (flatten_bn, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+
+is_hpu = current_platform.is_hpu()
 
 logger = init_logger(__name__)
 
@@ -1002,6 +1005,8 @@ class QWenBaseModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+            if is_hpu:
+                torch.hpu.synchronize()
         return loaded_params
 
 

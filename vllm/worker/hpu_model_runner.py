@@ -142,6 +142,8 @@ def get_decoder_layer_suffix(model_type):
     # be specified here.
     decoder_layer_table = {
         "gpt_bigcode": "BigCodeBlock",
+        "qwen": "QWenBlock",
+        "chatglm": "GLMBlock",
     }
 
     return decoder_layer_table.get(model_type, "DecoderLayer")
@@ -1095,6 +1097,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
+        finished_requests_ids: Optional[List[str]] = None
     ) -> Tuple[TModelInputForHPU, SamplingMetadata]:
         if len(seq_group_metadata_list) == 0:
             return self._model_input_cls(), None
@@ -1158,10 +1161,13 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             decode_slot_mapping,
             decode_lora_ids,
         ) = self._prepare_decode(decode_reqs)
+        generators = self.get_generators(finished_requests_ids)
         sampling_metadata = SamplingMetadata.prepare(seq_group_metadata_list,
-                                                     seq_lens, query_lens,
+                                                     seq_lens,
+                                                     query_lens,
                                                      self.device,
-                                                     self.pin_memory)
+                                                     self.pin_memory,
+                                                     generators=generators)
 
         if not self.scheduler_config.chunked_prefill_enabled:
             assert (len(prefill_reqs) and len(decode_reqs)) == 0
@@ -1826,7 +1832,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 self.profiler_counter_helper.capture_seq_group_metadata_stats(
                     seq_group_metadata_list=seq_group_metadata_list)
             model_input, sampling_metadata = self.prepare_input_tensors(
-                seq_group_metadata_list)
+                seq_group_metadata_list, finished_requests_ids)
             assert model_input.attn_metadata is not None
             is_prompt = model_input.attn_metadata.is_prompt
 
