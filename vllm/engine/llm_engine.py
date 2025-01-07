@@ -841,7 +841,9 @@ class LLMEngine:
         if arrival_time is None:
             arrival_time = time.time()
 
-        if self.tokenizer is not None:
+        if self.tokenizer is not None and not (
+                self.model_config.hf_config.model_type == "qwen"
+                and self.model_config.is_multimodal_model):
             self._validate_token_prompt(
                 prompt,
                 tokenizer=self.get_tokenizer(lora_request=lora_request))

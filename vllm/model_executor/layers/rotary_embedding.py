@@ -27,6 +27,9 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
+
+is_hpu = current_platform.is_hpu()
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -413,7 +416,9 @@ def _yarn_linear_ramp_mask(low: float, high: float, dim: int,
     if low == high:
         high += 0.001  # Prevent singularity
 
-    linear_func = (torch.arange(dim, dtype=dtype) - low) / (high - low)
+    linear_func = (
+        torch.arange(dim, dtype=dtype, device="hpu" if is_hpu else "cuda") -
+        low) / (high - low)
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
@@ -652,9 +657,12 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
                          is_neox_style, dtype)
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
-        pos_freqs = self.base**(torch.arange(
-            0, self.rotary_dim, 2, dtype=torch.float, device="cuda") /
-                                self.rotary_dim)
+        pos_freqs = self.base**(
+            torch.arange(0,
+                         self.rotary_dim,
+                         2,
+                         dtype=torch.float,
+                         device="hpu" if is_hpu else "cuda") / self.rotary_dim)
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
@@ -672,7 +680,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(self.max_position_embeddings * self.scaling_factor,
-                         device="cuda",
+                         device="hpu" if is_hpu else "cuda",
                          dtype=torch.float32)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = (freqs.cos() * self.mscale)

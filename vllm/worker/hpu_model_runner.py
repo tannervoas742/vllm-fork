@@ -29,12 +29,14 @@ from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import DeviceConfig, VllmConfig
 from vllm.distributed import broadcast_tensor_dict
 from vllm.distributed.parallel_state import get_world_group
+from vllm.inputs import INPUT_REGISTRY, InputRegistry
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
@@ -42,7 +44,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.sampling_metadata import SequenceGroupToSample
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
-                             MultiModalKwargs)
+                             MultiModalKwargs, MultiModalRegistry)
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
                            Logprob, SequenceData, SequenceGroupMetadata,
@@ -142,6 +144,8 @@ def get_decoder_layer_suffix(model_type):
     # be specified here.
     decoder_layer_table = {
         "gpt_bigcode": "BigCodeBlock",
+        "qwen": "QWenBlock",
+        "chatglm": "GLMBlock",
     }
 
     return decoder_layer_table.get(model_type, "DecoderLayer")
@@ -511,6 +515,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
         return_hidden_states: bool = False,
+        input_registry: InputRegistry = INPUT_REGISTRY,
+        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
         ModelRunnerBase.__init__(self, vllm_config=vllm_config)
         self.is_driver_worker = is_driver_worker
@@ -518,8 +524,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
         self.sliding_window = (self.model_config.get_sliding_window()
                                if self.model_config is not None else None)
-        self.device_config = (self.device_config if self.device_config
-                              is not None else DeviceConfig())
+        self.device_config = (vllm_config.device_config
+                              if vllm_config is not None else DeviceConfig())
         if is_fake_hpu():
             self.device_config.device = torch.device('cpu')
             self.device_config.device_type = 'cpu'
@@ -549,6 +555,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             self.model_config.is_attention_free,
         ) if needs_attn_backend else None
 
+        # Multi-modal data support
+        self.input_registry = input_registry
+        self.mm_registry = mm_registry
+
         # Lazy initialization
         self.lora_manager: LRUCacheWorkerLoRAManager = None
         self.model: torch.nn.Module = None
@@ -568,6 +578,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self._set_gc_threshold()
         self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
                                                 'true').lower() == 'true'
+        if vllm_config.speculative_config is not None \
+            and self.use_contiguous_pa:
+            raise ValueError(
+                "Speculative decoding is not supported with "
+                "contiguous PA, please set VLLM_CONTIGUOUS_PA=false")
         # For multi-step scheduling
         self.cached_step_outputs: List[torch.Tensor] = []
 
@@ -593,6 +608,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         # Multi-modal data support
         self.multi_modal_input_mapper = MULTIMODAL_REGISTRY \
             .create_input_mapper(self.model_config)
+        self.mm_registry.init_mm_limits_per_prompt(self.model_config)
 
         self.skip_warmup = os.environ.get('VLLM_SKIP_WARMUP',
                                           'false').lower() == 'true'
@@ -696,12 +712,46 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def _is_valid_bucket(self, bucket):
         return bucket[0] * bucket[1] <= self.max_num_batched_tokens
 
+    def _compute_multi_modal_input(self, seq_data: SequenceData, mm_data,
+                                   computed_len: int):
+        mm_kwargs = self.multi_modal_input_mapper(mm_data)
+
+        # special processing for mrope position deltas.
+        mrope_positions = None
+        if self.model_is_mrope:
+            image_grid_thw = mm_kwargs.get("image_grid_thw", None)
+            video_grid_thw = mm_kwargs.get("video_grid_thw", None)
+            assert image_grid_thw is not None or video_grid_thw is not None, (
+                "mrope embedding type requires multi-modal input mapper "
+                "returns 'image_grid_thw' or 'video_grid_thw'.")
+
+            hf_config = self.model_config.hf_config
+            token_ids = seq_data.get_token_ids()
+
+            mrope_positions, mrope_position_delta = \
+                MRotaryEmbedding.get_input_positions(
+                    token_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    image_token_id=hf_config.image_token_id,
+                    video_token_id=hf_config.video_token_id,
+                    vision_start_token_id=hf_config.vision_start_token_id,
+                    vision_end_token_id=hf_config.vision_end_token_id,
+                    spatial_merge_size=hf_config.vision_config.
+                    spatial_merge_size,
+                    context_len=computed_len,
+                )
+            seq_data.mrope_position_delta = mrope_position_delta
+        return mm_kwargs, mrope_positions
+
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> PreparePromptMetadata:
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
+        input_mrope_positions: List[List[int]] = [[] for _ in range(3)]
+
         slot_mapping: List[List[int]] = []
         lora_index_mapping: List[List[int]] = []
         lora_prompt_mapping: List[List[int]] = []
@@ -738,6 +788,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             # it contains output tokens.
             seq_len = min(seq_data.get_len(), context_len + token_chunk_size)
             prompt_tokens = seq_data.get_token_ids()[context_len:seq_len]
+            computed_len = seq_data.get_num_computed_tokens()
             seq_lens.append(seq_len)
 
             # NOTE: This only works for oooooooxxx style attention.
@@ -765,14 +816,20 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             context_lens.append(context_len)
             query_lens.append(seq_len - context_len)
             input_tokens.append(prompt_tokens)
+
+            mrope_positions = None
+            if (mm_data := seq_group_metadata.multi_modal_data):
+                mm_kwargs, mrope_positions = self._compute_multi_modal_input(
+                    seq_data, mm_data, computed_len)
+                multi_modal_kwargs_list.append(mm_kwargs)
+
             # NOTE(woosuk): Here we assume that the first token in the prompt
             # is always the first token in the sequence.
-            input_positions.append(list(range(context_len, seq_len)))
-
-            mm_data = seq_group_metadata.multi_modal_data
-            if mm_data:
-                mm_kwargs = self.multi_modal_input_mapper(mm_data)
-                multi_modal_kwargs_list.append(mm_kwargs)
+            if mrope_positions:
+                for idx in range(3):
+                    input_mrope_positions[idx].append(mrope_positions[idx])
+            else:
+                input_positions.append(list(range(computed_len, seq_len)))
 
             if seq_group_metadata.block_tables is None:
                 # During memory profiling, the block tables are not initialized
@@ -804,6 +861,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 block_offset = i % self.block_size
                 slot = block_number * self.block_size + block_offset
                 slot_mapping[-1].append(slot)
+
+        if any(input_mrope_positions):
+            input_positions = None  # type: ignore
+        else:
+            input_mrope_positions = None  # type: ignore
 
         max_query_len = max(query_lens)
         sum_query_len = sum(query_lens)
@@ -857,7 +919,21 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                             dtype=torch.long,
                                             device='cpu')
 
-        input_positions = make_tensor_with_pad(input_positions,
+        if len(multi_modal_kwargs_list
+               ) > 0 and 'img_idx' in multi_modal_kwargs_list[0]:
+            new_img_idx_list = []
+            for i, multi_modal_inputs_content in enumerate(
+                    multi_modal_kwargs_list):
+                img_idx_new = multi_modal_inputs_content[
+                    'img_idx'] + i * max_prompt_len
+                new_img_idx_list.append(img_idx_new)
+            for i, multi_modal_inputs_content in enumerate(
+                    multi_modal_kwargs_list):
+                multi_modal_inputs_content['img_idx'] = new_img_idx_list[
+                    i].clone()
+
+        input_positions = make_tensor_with_pad(input_positions
+                                               or input_mrope_positions,
                                                max_len=max_prompt_len,
                                                pad=0,
                                                dtype=torch.long,
@@ -909,7 +985,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             multi_modal_placeholder_index_maps=
             None  # FIXME(kzawora): mutli-modality will not work here
         )
-        multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
+        multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list,
+                                                    device=self.device)
 
         return PreparePromptMetadata(input_tokens=input_tokens,
                                      input_positions=input_positions,
@@ -930,6 +1007,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     ) -> PrepareDecodeMetadata:
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
+        input_mrope_positions: List[List[int]] = [[] for _ in range(3)]
         slot_mapping: List[List[int]] = []
         seq_lens: List[int] = []
         block_tables: List[List[int]] = []
@@ -963,7 +1041,17 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
                 seq_len = seq_data.get_len()
                 position = seq_len - 1
-                input_positions.append([position])
+                if seq_data.mrope_position_delta is not None:
+                    context_len = seq_data.get_num_computed_tokens()
+                    next_pos = MRotaryEmbedding.get_next_input_positions(
+                        seq_data.mrope_position_delta,
+                        context_len,
+                        seq_len,
+                    )
+                    for idx in range(3):
+                        input_mrope_positions[idx].append(next_pos[idx])
+                else:
+                    input_positions.append(position)
 
                 seq_len = seq_len if self.sliding_window is None else min(
                     seq_len, self.sliding_window)
@@ -992,6 +1080,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
 
+        if any(input_mrope_positions):
+            input_positions = None  # type: ignore
+        else:
+            input_mrope_positions = None  # type: ignore
+
         if output is None:
             input_tokens = torch.tensor(input_tokens,
                                         dtype=torch.long,
@@ -1000,7 +1093,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             real_batch_size = len(seq_group_metadata_list)
             input_tokens = output[:real_batch_size]
 
-        input_positions = torch.tensor(input_positions,
+        input_positions = torch.tensor(input_positions
+                                       or input_mrope_positions,
                                        dtype=torch.long,
                                        device='cpu')
 
@@ -1095,6 +1189,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
+        finished_requests_ids: Optional[List[str]] = None
     ) -> Tuple[TModelInputForHPU, SamplingMetadata]:
         if len(seq_group_metadata_list) == 0:
             return self._model_input_cls(), None
@@ -1158,10 +1253,13 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             decode_slot_mapping,
             decode_lora_ids,
         ) = self._prepare_decode(decode_reqs)
+        generators = self.get_generators(finished_requests_ids)
         sampling_metadata = SamplingMetadata.prepare(seq_group_metadata_list,
-                                                     seq_lens, query_lens,
+                                                     seq_lens,
+                                                     query_lens,
                                                      self.device,
-                                                     self.pin_memory)
+                                                     self.pin_memory,
+                                                     generators=generators)
 
         if not self.scheduler_config.chunked_prefill_enabled:
             assert (len(prefill_reqs) and len(decode_reqs)) == 0
@@ -1255,6 +1353,15 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                      batch_size_padded=batch_size_padded,
                                      lora_ids=lora_ids), \
                                         sampling_metadata
+
+    @property
+    def model_is_mrope(self) -> bool:
+        """Detect if the model has "mrope" rope_scaling type.
+        mrope requires keep "rope_deltas" between prompt and decoding phases."""
+        rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
+        if rope_scaling is None:
+            return False
+        return rope_scaling.get("type", None) == "mrope"
 
     def _seq_len(self, attn_metadata):
         if attn_metadata.num_prefills != 0:
@@ -1826,7 +1933,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 self.profiler_counter_helper.capture_seq_group_metadata_stats(
                     seq_group_metadata_list=seq_group_metadata_list)
             model_input, sampling_metadata = self.prepare_input_tensors(
-                seq_group_metadata_list)
+                seq_group_metadata_list, finished_requests_ids)
             assert model_input.attn_metadata is not None
             is_prompt = model_input.attn_metadata.is_prompt
 

@@ -44,6 +44,7 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
 from vllm.multimodal.utils import cached_get_tokenizer
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors, SequenceData
 from vllm.utils import is_list_of
 
@@ -51,6 +52,8 @@ from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsPP
 from .utils import (flatten_bn, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+
+is_hpu = current_platform.is_hpu()
 
 logger = init_logger(__name__)
 
@@ -395,7 +398,7 @@ class VisionTransformer(nn.Module):
         if torch.any(input_ids == self.image_start_id):
             bos_pos = torch.where(input_ids == self.image_start_id)
             eos_pos = torch.where(input_ids == self.image_end_id)
-            return torch.stack((bos_pos[0], eos_pos[0]), dim=1)
+            return torch.stack((bos_pos[1], eos_pos[1]), dim=1)
         return None
 
 
@@ -589,6 +592,7 @@ class QWenModel(nn.Module):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
         pixel_values: Optional[QwenImageInputs],
+        img_idx: Optional[torch.LongTensor],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         img_pos = None
@@ -615,11 +619,17 @@ class QWenModel(nn.Module):
             else:
                 hidden_states = self.get_input_embeddings(input_ids)
             hidden_states = self.wte(input_ids)
+
             # Merge the image embeddings into the hidden states if actually have
-            # visual features and the corresponding image tokens
-            if img_pos is not None:
-                for idx, (img_bos, img_eos) in enumerate(img_pos):
-                    hidden_states[img_bos + 1:img_eos] = image_embeds[idx]
+            # visual features and the corresponding image token
+            batch_size, seq_length, hidden_size = hidden_states.shape
+            if pixel_values is not None and self.visual is not None:
+                hidden_states = hidden_states.reshape(-1, hidden_size)
+                image_embeds = image_embeds.reshape(-1, hidden_size)
+                img_idx = img_idx.reshape(-1)
+                hidden_states.index_copy_(0, img_idx, image_embeds)
+                hidden_states = hidden_states.reshape(batch_size, seq_length,
+                                                      hidden_size)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -634,6 +644,7 @@ class QWenModel(nn.Module):
                 attn_metadata,
                 residual,
             )
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
@@ -724,6 +735,21 @@ def input_processor_for_qwen(ctx: InputContext,
 
     new_prompt_token_ids = tokenizer.encode(new_prompt)
 
+    image_pair_tok = tokenizer.encode(IMG_START + IMG_END,
+                                      add_special_tokens=False,
+                                      return_tensors="pt").squeeze()
+    image_start_id = image_pair_tok[0]
+    image_end_id = image_pair_tok[-1]
+    input_ids = torch.tensor(new_prompt_token_ids)
+    if torch.any(input_ids == image_start_id):
+        img_start_pos_list = ((torch.where(input_ids == image_start_id))[0] +
+                              1).tolist()
+        img_end_pos_list = (torch.where(input_ids == image_end_id))[0].tolist()
+    images_idx = []
+    for i in range(len(img_start_pos_list)):
+        images_idx = images_idx + list(
+            range(img_start_pos_list[i], img_end_pos_list[i]))
+    multi_modal_data["img_idx"] = torch.tensor(images_idx)
     return token_inputs(prompt=new_prompt,
                         prompt_token_ids=new_prompt_token_ids,
                         multi_modal_data=multi_modal_data)
@@ -870,6 +896,12 @@ def dummy_data_for_qwen(
     return DummyData(seq_data, mm_data)
 
 
+def input_imageidx_mapper_for_qwen(ctx: InputContext,
+                                   data: object) -> MultiModalKwargs:
+    img_idx = data
+    return MultiModalKwargs({"img_idx": img_idx})
+
+
 class QWenBaseModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -907,7 +939,8 @@ class QWenBaseModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
             the visual transformer needs to process the pixel_values.
         """
         if pixel_values is not None and self.transformer.visual is not None:
-            pixel_values = flatten_bn(pixel_values)
+            if len(pixel_values.shape) > 4:
+                pixel_values = flatten_bn(pixel_values)
             if len(pixel_values.shape) == 3 and pixel_values.shape[
                     1] == MAX_QWEN_IMG_TOKENS and pixel_values.shape[
                         2] == self.config.visual["output_dim"]:
@@ -935,6 +968,7 @@ class QWenBaseModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         pixel_values: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        img_idx: Optional[torch.LongTensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if intermediate_tensors is not None:
             input_ids = None
@@ -944,7 +978,7 @@ class QWenBaseModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
 
         hidden_states = self.transformer(input_ids, positions, kv_caches,
                                          attn_metadata, intermediate_tensors,
-                                         pixel_values, inputs_embeds)
+                                         pixel_values, img_idx, inputs_embeds)
         return hidden_states
 
     def compute_logits(
@@ -1002,6 +1036,8 @@ class QWenBaseModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+            if is_hpu:
+                torch.hpu.synchronize()
         return loaded_params
 
 
@@ -1058,6 +1094,8 @@ class QWenVL(QWenBaseModel):
             tower_model="transformer.visual.transformer")
 
 
+@MULTIMODAL_REGISTRY.register_input_mapper("img_idx",
+                                           input_imageidx_mapper_for_qwen)
 @MULTIMODAL_REGISTRY.register_image_input_mapper(input_mapper_for_qwen)
 @MULTIMODAL_REGISTRY.register_max_image_tokens(MAX_QWEN_IMG_TOKENS)
 @INPUT_REGISTRY.register_dummy_data(dummy_data_for_qwen)

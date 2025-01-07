@@ -1,9 +1,11 @@
 import itertools
+import os
 import warnings
 from contextlib import contextmanager
 from typing import (Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Type,
                     Union, cast, overload)
 
+import torch
 from tqdm import tqdm
 
 from vllm import envs
@@ -214,6 +216,41 @@ class LLM:
 
         self.request_counter = Counter()
 
+        self.profiler = self._setup_profiler()
+
+    def _setup_profiler(self):
+        enable_profile = os.getenv("VLLM_DEVICE_PROFILER_ENABLED",
+                                   "false").lower() in ["true", "1"]
+        if not enable_profile:
+            return None
+        warmup = int(os.getenv("VLLM_DEVICE_PROFILER_WARMUP_STEPS", "0"))
+        steps = int(os.getenv("VLLM_DEVICE_PROFILER_STEPS", "1"))
+        repeat = int(os.getenv("VLLM_DEVICE_PROFILER_REPEAT", "1"))
+        schedule = torch.profiler.schedule(wait=0,
+                                           warmup=warmup,
+                                           active=steps,
+                                           repeat=repeat)
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.HPU
+        ]
+
+        #from habana_frameworks.torch.activity_profiler import DebugActivity
+        #debug_activities=[DebugActivity.BRIDGE_FUNCTION_CALLS]
+
+        profiler = torch.profiler.profile(
+            schedule=schedule,
+            activities=activities,
+            #debug_activities=debug_activities,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                '.', use_gzip=True),
+            record_shapes=False,
+            with_modules=False,
+            profile_memory=False,
+            with_stack=True)
+
+        return profiler
+
     @staticmethod
     def get_engine_class() -> Type[LLMEngine]:
         if envs.VLLM_USE_V1:
@@ -360,6 +397,22 @@ class LLM:
             considered legacy and may be deprecated in the future. You should
             instead pass them via the ``inputs`` parameter.
         """
+        from vllm import debug_store
+        batch_count = debug_store.get("batch_count")
+        if batch_count is None:
+            batch_count = 1
+        else:
+            batch_count += 1
+        debug_store.set("batch_count", batch_count)
+        per_batch_info = debug_store.get("per_batch_info")
+        if per_batch_info is None:
+            per_batch_info = [{}]
+        else:
+            per_batch_info += [{}]
+        debug_store.set("per_batch_info", per_batch_info)
+        per_batch_info[-1]["samples"] = len(prompts)
+        per_batch_info[-1]["sample_lens"] = [len(i) for i in prompts]
+        per_batch_info[-1]["per_step_info"] = []
         task = self.llm_engine.model_config.task
         if task != "generate":
             messages = [
@@ -960,6 +1013,8 @@ class LLM:
         outputs: List[Union[RequestOutput, EmbeddingRequestOutput]] = []
         total_in_toks = 0
         total_out_toks = 0
+        if self.profiler:
+            self.profiler.start()
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
@@ -979,9 +1034,15 @@ class LLM:
                                 f"est. speed input: {in_spd:.2f} toks/s, "
                                 f"output: {out_spd:.2f} toks/s")
                         pbar.update(1)
+            if self.profiler:
+                self.profiler.step()
 
         if use_tqdm:
             pbar.close()
+
+        if self.profiler:
+            torch.hpu.synchronize()
+            self.profiler.stop()
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.

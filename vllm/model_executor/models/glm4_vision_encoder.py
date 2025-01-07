@@ -17,12 +17,18 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+from vllm.platforms import current_platform
+
+is_hpu = current_platform.is_hpu()
+if is_hpu:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
 
 
 class PatchEmbedding(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+
         self.proj = nn.Conv2d(config.in_channels,
                               config.hidden_size,
                               kernel_size=config.patch_size,
@@ -47,6 +53,7 @@ class PatchEmbedding(nn.Module):
         cls_token = self.cls_embedding.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_token, x), dim=1)
         x += self.position_embedding.weight.unsqueeze(0)
+
         return x
 
 
@@ -88,15 +95,13 @@ class Attention(nn.Module):
                       self.head_dim).permute(0, 2, 1, 3)  # B, H, L, D
         v = v.reshape(B, L, self.num_heads_per_rank,
                       self.head_dim).permute(0, 2, 1, 3)  # B, H, L, D
-
-        out = torch.nn.functional.scaled_dot_product_attention(q,
-                                                               k,
-                                                               v,
-                                                               attn_mask=None,
-                                                               dropout_p=0.,
-                                                               is_causal=False)
-
-        output, _ = self.dense(out.transpose(1, 2).view(B, L, -1))
+        if is_hpu:
+            out = FusedSDPA.apply(q, k, v, None, 0., False, None, 'fast', True,
+                                  None, 'right')
+        else:
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=0., is_causal=False)
+        output, _ = self.dense(out.transpose(1, 2).reshape(B, L, -1))
         output = self.output_dropout(output)
         return output
 
@@ -282,10 +287,10 @@ class EVA2CLIPModel(nn.Module):
         x = self.patch_embedding(images)
         x = self.transformer(x)
         x = x[:, 1:]
-
         b, s, h = x.shape
         grid_size = int(s**0.5)
-        x = x.view(b, grid_size, grid_size, h).permute(0, 3, 1, 2)
+
+        x = x.reshape(b, grid_size, grid_size, h).permute(0, 3, 1, 2)
         x = self.conv(x)
 
         x = x.flatten(2).transpose(1, 2)

@@ -116,7 +116,7 @@ class EngineArgs:
     enable_prefix_caching: bool = False
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
-    use_padding_aware_scheduling: bool = False
+    use_padding_aware_scheduling: bool = current_platform.is_hpu()
     swap_space: float = 4  # GiB
     cpu_offload_gb: float = 0  # GiB
     gpu_memory_utilization: float = 0.90
@@ -427,7 +427,7 @@ class EngineArgs:
             action='store_true',
             help=('Use padding-aware scheduling. If True, the scheduler '
                   'will consider padded tokens in prefill. '
-                  'By default this is set to False. '))
+                  'By default this is set to False on non-HPU devices. '))
         parser.add_argument(
             '--num-lookahead-slots',
             type=int,
