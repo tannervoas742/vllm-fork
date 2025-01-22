@@ -728,6 +728,15 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
                 execute_model_req, self._seq_with_bonus_token_in_last_step)
 
         from vllm import debug_store
+        #fallback_non_spec = any([proposal_len == 0 for proposal_len in proposals.proposal_lens])
+        #if fallback_non_spec:
+        #    # NOTE(Tanner): The current code doesnt support batches where
+        #    #               some items in a batch has speculative tokens
+        #    #               and others do not. Thus, we must run with no
+        #    #               speculative decoding if any have no tokens.
+        #    debug_store.get("per_batch_info")[-1]["per_step_info"][-1] = 0
+        #    return self._run_no_spec(execute_model_req,
+        #                             skip_proposer=False)
 
         debug_store.get("per_batch_info")[-1]["per_step_info"][-1] = 1
 
@@ -764,9 +773,15 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             self.proposer_worker.execute_model(prefill_req)
 
         with Timer() as verification_timer:
-            accepted_token_ids, target_logprobs = self._verify_tokens(
+            # Modify this section to retrieve accepted tokens and logprobs
+            accepted_token_ids, target_logprobs, hits_per_sequence = self._verify_tokens(
                 execute_model_req.seq_group_metadata_list, proposal_scores,
                 proposals, execute_model_req.num_lookahead_slots)
+
+            # Calculate the average number of hits
+            average_hits = sum(hits_per_sequence) / len(hits_per_sequence)
+            # Store `1 + average_hits` in the debug store
+            debug_store.get("per_batch_info")[-1]["per_step_info"][-1] = 1 + average_hits
 
         stage_times = (proposal_timer.elapsed_time_ms / num_lookahead_slots,
                        scoring_timer.elapsed_time_ms,
@@ -786,12 +801,13 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         proposal_scores: SpeculativeScores,
         proposals: SpeculativeProposals,
         max_proposal_len: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
         """Determine which speculative tokens are accepted using the
         probabilities of each token according to the proposer and scorer models.
-
-        Returns a tuple of Tensors, one for the accepted token ids and one for
-        the logprobs according to the scoring model.
+        Returns a tuple of:
+        - Tensor of accepted token IDs.
+        - Tensor of logprobs.
+        - List of hits per sequence.
         """
         proposal_lens_list = proposals.proposal_lens.tolist()
 
@@ -861,7 +877,12 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             self.previous_hidden_states = HiddenStates(
                 hidden_states, seq_group_metadata_list,
                 second_last_token_hidden_states)
-        return accepted_token_ids, logprobs
+
+        hits_per_sequence = [
+            (accepted_token_ids[seq_idx] != -1).sum().item()
+            for seq_idx in range(accepted_token_ids.size(0))
+        ]
+        return accepted_token_ids, logprobs, hits_per_sequence
 
     def _create_output_sampler_list(
         self,

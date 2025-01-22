@@ -1,4 +1,4 @@
-FROM vault.habana.ai/gaudi-docker/1.19.0/ubuntu22.04/habanalabs/pytorch-installer-2.5.1:latest
+FROM artifactory-kfs.habana-labs.com/docker-local/1.19.1/ubuntu22.04/habanalabs/pytorch-installer-2.5.1:1.19.1-26
 
 COPY ./ /workspace/vllm
 
@@ -9,10 +9,42 @@ RUN pip install -v -r requirements-hpu.txt
 ENV no_proxy=localhost,127.0.0.1
 ENV PT_HPU_ENABLE_LAZY_COLLECTIVES=true
 
+#ENV VLLM_PROMPT_USE_FUSEDSDPA=0
+#ENV VLLM_PROMPT_ALIBI_MAX_SEQ_LEN=2000
+#ENV PT_HPU_LAZY_MODE=0
+ENV VLLM_CONTIGUOUS_PA=false
+ENV VLLM_SKIP_WARMUP=true
+#ENV VLLM_ALIBI_USE_FLOAT32_BIASES=1
+#ENV VLLM_FP32_SOFTMAX=true
+
+
+ENV VLLM_PROMPT_BS_BUCKET_MIN=16
+ENV VLLM_PROMPT_BS_BUCKET_STEP=16
+ENV VLLM_PROMPT_BS_BUCKET_MAX=224
+ENV VLLM_DECODE_BS_BUCKET_MIN=16
+ENV VLLM_DECODE_BS_BUCKET_STEP=16
+ENV VLLM_DECODE_BS_BUCKET_MAX=256
+ENV VLLM_PROMPT_SEQ_BUCKET_MIN=128
+ENV VLLM_PROMPT_SEQ_BUCKET_STEP=128
+ENV VLLM_PROMPT_SEQ_BUCKET_MAX=768
+ENV VLLM_DECODE_BLOCK_BUCKET_MIN=384
+ENV VLLM_DECODE_BLOCK_BUCKET_STEP=128
+ENV VLLM_DECODE_BLOCK_BUCKET_MAX=768
+
+
 RUN VLLM_TARGET_DEVICE=hpu python3 setup.py install
+
+# install development dependencies (for testing)
+#RUN python3 -m pip install -e tests/vllm_test_utils
+
+#RUN cd vllm-hpu-extension && \
+#    python3 -m pip install -e . && \
+#    cd ..
+
+RUN python3 -m pip install evaluate bert_score
 
 WORKDIR /workspace/
 
-RUN ln -s /workspace/vllm/tests && ln -s /workspace/vllm/examples && ln -s /workspace/vllm/benchmarks
+#RUN ln -s /workspace/vllm/tests && ln -s /workspace/vllm/examples && ln -s /workspace/vllm/benchmarks
 
-ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+#ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
