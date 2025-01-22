@@ -15,6 +15,7 @@ from vllm.outputs import (CompletionOutput, EmbeddingOutput,
                           EmbeddingRequestOutput, RequestOutput)
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.logging_utils.debug_util import debug_store
 
 from .version import __version__, __version_tuple__
 
