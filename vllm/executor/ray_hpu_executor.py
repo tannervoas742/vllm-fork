@@ -96,8 +96,8 @@ class RayHPUExecutor(DistributedGPUExecutor):
             worker_module_name = "vllm.worker.multi_step_hpu_worker"
             worker_class_name = "MultiStepHPUWorker"
         elif self.speculative_config:
-            raise NotImplementedError(
-                "Speculative decoding is not implemented for HPU")
+            worker_module_name = "vllm.spec_decode.spec_decode_worker"
+            worker_class_name = "create_spec_worker"
         else:
             worker_module_name = "vllm.worker.hpu_worker"
             worker_class_name = "HPUWorker"

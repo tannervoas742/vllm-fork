@@ -5,9 +5,13 @@ from typing import Dict, List, Set, Tuple
 import torch
 
 from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.platforms import current_platform
 from vllm.sequence import (ExecuteModelRequest, HiddenStates, SequenceData,
                            SequenceGroupMetadata)
-from vllm.spec_decode.draft_model_runner import TP1DraftModelRunner
+
+if current_platform.is_cuda_alike():
+    from vllm.spec_decode.draft_model_runner import TP1DraftModelRunner
+
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
                                          SpeculativeProposer)
 from vllm.spec_decode.proposer_worker_base import ProposerWorkerBase
@@ -75,7 +79,7 @@ class MultiStepWorker(WorkerCls, ProposerWorkerBase):
 
         # Run model sample_len times.
         model_outputs: List[SamplerOutput] = []
-        if isinstance(
+        if current_platform.is_cuda_alike() and isinstance(
                 self.model_runner, TP1DraftModelRunner
         ) and self.model_runner.supports_gpu_multi_step(expanded_request):
             # Here we run the draft_model_runner with multi-step prepare
@@ -103,6 +107,9 @@ class MultiStepWorker(WorkerCls, ProposerWorkerBase):
                     indices_of_seq_with_bonus_tokens)
                 model_outputs.append(model_output)
 
+        # move indices to device to avoid stream sync
+        indices_of_seq_with_bonus_tokens = torch.tensor(
+            indices_of_seq_with_bonus_tokens, device=self.device)
         filtered_model_outputs = self._filter_model_output(
             model_outputs, indices_of_seq_with_bonus_tokens)
         return filtered_model_outputs, True
@@ -172,7 +179,7 @@ class MultiStepWorker(WorkerCls, ProposerWorkerBase):
     @staticmethod
     def _filter_model_output(
             expanded_batch_outputs: List[SamplerOutput],
-            output_indices_to_retain: List[int]) -> List[SamplerOutput]:
+            output_indices_to_retain: torch.Tensor) -> List[SamplerOutput]:
         """
         Filters the model output to include only the specified sequence
         outputs. This method contracts the expanded batch output from the
@@ -182,8 +189,8 @@ class MultiStepWorker(WorkerCls, ProposerWorkerBase):
         Args:
             expanded_batch_output (List[SamplerOutput]): The expanded output
                 batch from the model.
-            output_indices_to_retain (List[int]): Indices of the model outputs
-                to retain.
+            output_indices_to_retain (torch.Tensor): Indices of the model
+                outputs to retain.
 
         Returns:
             List[SamplerOutput]: A list containing the filtered model 
