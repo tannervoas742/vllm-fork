@@ -60,6 +60,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
+        print(f"Here is my rank: {self.rank}, am I a driver worker? {self.is_driver_worker}")
         if self.is_driver_worker:
             assert self.rank == 0, "The driver worker must have rank 0."
 
