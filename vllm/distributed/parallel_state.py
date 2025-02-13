@@ -940,6 +940,14 @@ def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
 
+def apply_hpu_workarounds():
+    import os
+    def update_wa_env_var(key, value):
+        if key not in os.environ.keys():
+            os.environ[key] = value
+
+    update_wa_env_var("PT_HPU_LAZY_ACC_PAR_MODE", "0")
+    update_wa_env_var("PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES", "0")
 
 def init_distributed_environment(
     world_size: int = -1,
@@ -948,7 +956,8 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ):
-    logger.debug(
+    apply_hpu_workarounds()
+    logger.info(
         "world_size=%d rank=%d local_rank=%d "
         "distributed_init_method=%s backend=%s", world_size, rank, local_rank,
         distributed_init_method, backend)
@@ -1089,17 +1098,30 @@ def ensure_model_parallel_initialized(
     """
     backend = backend or torch.distributed.get_backend(
         get_world_group().device_group)
+    logger.info(f"\n\nbackend: {backend}\n\n")
+    
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
                                   pipeline_model_parallel_size, backend)
+        pp_world_size = get_pp_group().world_size
+        pp_rank, pp_local_rank, pp_rank_in_group = get_pp_group().rank, get_pp_group().local_rank, get_pp_group().rank_in_group
+        tp_world_size = get_tp_group().world_size
+        tp_rank, tp_local_rank, tp_rank_in_group = get_tp_group().rank, get_tp_group().local_rank, get_tp_group().rank_in_group
+        logger.info(f"\n\npp_world_size: {pp_world_size}, pp_rank: {pp_rank}, pp_local_rank: {pp_local_rank}, pp_rank_in_group: {pp_rank_in_group}\n\n")
+        logger.info(f"\n\ntp_world_size: {tp_world_size}, tp_rank: {tp_rank}, tp_local_rank: {tp_local_rank}, tp_rank_in_group: {tp_rank_in_group}\n\n")
         return
+    pp_world_size = get_pp_group().world_size
+    pp_rank, pp_local_rank, pp_rank_in_group = get_pp_group().rank, get_pp_group().local_rank, get_pp_group().rank_in_group
+    tp_world_size = get_tp_group().world_size
+    tp_rank, tp_local_rank, tp_rank_in_group = get_tp_group().rank, get_tp_group().local_rank, get_tp_group().rank_in_group
+    logger.info(f"\n\npp_world_size: {pp_world_size}, pp_rank: {pp_rank}, pp_local_rank: {pp_local_rank}, pp_rank_in_group: {pp_rank_in_group}\n\n")
+    logger.info(f"\n\ntp_world_size: {tp_world_size}, tp_rank: {tp_rank}, tp_local_rank: {tp_local_rank}, tp_rank_in_group: {tp_rank_in_group}\n\n")
 
     assert (
         get_tensor_model_parallel_world_size() == tensor_model_parallel_size
     ), ("tensor parallel group already initialized, but of unexpected size: "
         f"{get_tensor_model_parallel_world_size()=} vs. "
         f"{tensor_model_parallel_size=}")
-    pp_world_size = get_pp_group().world_size
     assert (pp_world_size == pipeline_model_parallel_size), (
         "pipeline parallel group already initialized, but of unexpected size: "
         f"{pp_world_size=} vs. "
@@ -1183,6 +1205,11 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
     from vllm.platforms import current_platform
     if not current_platform.is_cpu():
         torch.cuda.empty_cache()
+    try:
+        torch._C._host_emptyCache()
+    except AttributeError:
+        logger.warning(
+            "torch._C._host_emptyCache() only available in Pytorch >=2.5")
 
 
 def in_the_same_node_as(pg: Union[ProcessGroup, StatelessProcessGroup],

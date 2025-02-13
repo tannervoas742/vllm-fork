@@ -29,7 +29,7 @@ from vllm_hpu_extension.profiler import (HabanaHighLevelProfiler,
 
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import DeviceConfig, VllmConfig
-from vllm.distributed import broadcast_tensor_dict
+from vllm.distributed import broadcast_tensor_dict, get_pp_group
 from vllm.distributed.parallel_state import get_world_group
 from vllm.forward_context import set_forward_context
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
@@ -215,6 +215,7 @@ def get_path_to_rope(model: torch.nn.Module):
 class HpuModelAdapter:
 
     def __init__(self, model, vllm_config, layer_names):
+        #logger.info(f"[STACK_TRACE] HpuModelAdapter.__init__.start")
         self.model = model
         self.prefill_use_fusedsdpa = "fsdpa" in enabled_flags()
         self.recompute_cos_sin = os.getenv('VLLM_COS_SIN_RECOMPUTE',
@@ -236,6 +237,7 @@ class HpuModelAdapter:
                 self.model = torch.compile(self.model,
                                            backend='hpu_backend',
                                            dynamic=False)
+        #logger.info(f"[STACK_TRACE] HpuModelAdapter.__init__.end")
 
     def _regional_compilation(self,
                               module,
@@ -390,6 +392,7 @@ class HpuModelAdapter:
                 a 'prepare_cos_sin' method.")
 
     def forward(self, *args, **kwargs):
+        #logger.info(f"[STACK_TRACE] HpuModelAdapter.forward.start")
         kwargs = kwargs.copy()
         selected_token_indices = kwargs.pop('selected_token_indices')
         if 'warmup_mode' in kwargs:
@@ -407,9 +410,11 @@ class HpuModelAdapter:
         with set_forward_context(kwargs['attn_metadata'], self.vllm_config,
                                  virtual_engine):
             hidden_states = self.model(*args, **kwargs)
-            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-            hidden_states = hidden_states.index_select(0,
-                                                       selected_token_indices)
+            if get_pp_group().is_last_rank:
+                hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+                hidden_states = hidden_states.index_select(
+                    0, selected_token_indices)
+        #logger.info(f"[STACK_TRACE] HpuModelAdapter.forward.end")
         return hidden_states
 
     def compute_logits(self, *args, **kwargs):
@@ -417,6 +422,9 @@ class HpuModelAdapter:
 
     def sample(self, *args, **kwargs):
         return self.model.sample(*args, **kwargs)
+
+    def make_empty_intermediate_tensors(self, *args, **kwargs):
+        return self.model.make_empty_intermediate_tensors(*args, **kwargs)
 
     def generate_proposals(self, *args, **kwargs):
         return self.model.generate_proposals(*args, **kwargs)
@@ -1575,17 +1583,22 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                      lora_request=lora_request)
 
     def profile_run(self) -> None:
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.profile_run.start")
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [None] * num_layers
+        bind_kv_caches = [
+            [None] * num_layers
+            for _ in range(self.parallel_config.pipeline_parallel_size)
+        ]
         bind_kv_cache(
             self.vllm_config.compilation_config.static_forward_context,
-            [kv_caches])
+            bind_kv_caches)
         _, max_seq_len = self.bucketing_ctx.get_max_prompt_shape()
         max_batch_size = min(self.max_num_seqs,
                              self.max_num_batched_tokens // max_seq_len)
-
         self.warmup_scenario(max_batch_size, max_seq_len, True, kv_caches,
                              False, True)
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.profile_run.end")
         return
 
     def warmup_scenario(self,
@@ -1596,6 +1609,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         is_pt_profiler_run=False,
                         is_lora_profile_run=False,
                         temperature=0) -> None:
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_scenario.start")
         use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
         scenario_name = ("warmup_"
                          f"{'prompt' if is_prompt else 'decode'}_"
@@ -1659,8 +1673,19 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             inputs = self.prepare_model_input(seqs)
             is_single_step = \
                 self.vllm_config.scheduler_config.num_scheduler_steps == 1
-            if is_prompt or is_single_step:
-                self.execute_model(inputs, kv_caches, warmup_mode=True)
+            if is_single_step:
+                intermediate_tensors = None
+                if not get_pp_group().is_first_rank:
+                    intermediate_tensors = \
+                        self.model.make_empty_intermediate_tensors(
+                            batch_size=batch_size,
+                            context_size=seq_len if is_prompt else 1,
+                            dtype=self.model_config.dtype,
+                            device=self.device)
+                self.execute_model(inputs,
+                                   kv_caches,
+                                   intermediate_tensors=intermediate_tensors,
+                                   warmup_mode=True)
             else:  # decode with multi-step
                 inputs = dataclasses.replace(inputs,
                                              is_first_multi_step=True,
@@ -1685,6 +1710,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             profiler.stop()
         self.profiler.end()
         gc.collect()
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_scenario.end")
 
     def remove_all_loras(self):
         if not self.lora_manager:
@@ -1730,10 +1756,12 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         logger.info(msg)
 
     def warmup_all_buckets(self, buckets, is_prompt, kv_caches):
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_all_buckets.start")
         for i, (batch_size, seq_len) in enumerate(reversed(buckets)):
             self.log_warmup('Prompt' if is_prompt else 'Decode', i,
                             len(buckets), batch_size, seq_len)
             self.warmup_scenario(batch_size, seq_len, is_prompt, kv_caches)
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_all_buckets.end")
 
     def warmup_graphs(self,
                       strategy,
@@ -1743,6 +1771,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                       available_mem,
                       starting_mem=0,
                       total_batch_seq=0.001):
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_graphs.start")
         total_mem = starting_mem
         idx = 0
         phase = f'Graph/{"Prompt" if is_prompt else "Decode"}'
@@ -1785,6 +1814,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             total_mem += used_mem
             total_batch_seq += batch_seq
 
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_graphs.end")
         return total_mem, total_batch_seq, captured_all
 
     def log_graph_warmup_summary(self, buckets, is_prompt, total_mem):
@@ -1802,6 +1832,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
     @torch.inference_mode()
     def warmup_model(self, kv_caches: List[torch.Tensor]) -> None:
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_model.start")
         if profile := os.environ.get('VLLM_PT_PROFILE', None):
             phase, bs, seq_len, graph = profile.split('_')
             is_prompt = phase == 'prompt'
@@ -1829,6 +1860,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 torch._dynamo.config.accumulated_cache_size_limit)
         if self.skip_warmup:
             logger.info("Skipping warmup...")
+            #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_model.end_1")
             return
         self.profiler.start('internal', 'warmup')
         start_mem = HabanaMemoryProfiler.current_device_memory_usage()
@@ -1926,6 +1958,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             f"allocated {format_bytes(end_mem - start_mem)} of device memory")
         logger.info(msg)
         self.profiler.end()
+        #logger.info(f"[STACK_TRACE] HpuModelRunnerBase.warmup_model.end_2")
 
     def finish_measurements(self):
         from neural_compressor.torch.quantization import finalize_calibration
@@ -2182,6 +2215,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
         previous_hidden_states: Optional[torch.Tensor] = None,
         seqs=None,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+        #logger.info(f"[STACK_TRACE] HpuModelRunner.execute_model.start")
         if not model_input.is_first_multi_step:
             if not model_input.is_last_step:
                 # not first or last multi-step
@@ -2221,7 +2255,6 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 lora_mask, lora_logits_mask = self.create_lora_mask(
                     input_tokens, model_input.lora_ids,
                     attn_metadata.is_prompt)
-
             execute_model_kwargs = {
                 "input_ids": input_tokens,
                 "positions": input_positions,
@@ -2267,6 +2300,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                                 data.output_token_ids[:orig_output_tokens_len]
 
             for i in range(num_steps):
+                #logger.info(f"[STACK_TRACE] HpuModelRunner.execute_model.step_{i}")
                 if i != 0 and not self.is_driver_worker:
                     broadcast_data = broadcast_tensor_dict(src=0)
                     if 'early_exit' in broadcast_data and broadcast_data[
@@ -2291,6 +2325,11 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     LoraMask.setLoraMask(
                         lora_logits_mask.index_select(
                             0, sampling_metadata.selected_token_indices))
+                    
+                # Compute the logits in the last pipeline stage.
+                if not get_pp_group().is_last_rank:
+                    #logger.info(f"[STACK_TRACE] HpuModelRunner.execute_model.end_1")
+                    return hidden_states
 
                 # Compute the logits.
                 with self.profiler.record_event(
@@ -2306,6 +2345,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 htorch.core.mark_step()
                 # Only perform sampling in the driver worker.
                 if not self.is_driver_worker:
+                    #logger.info(f"[STACK_TRACE] HpuModelRunner.execute_model.continue_1")
                     continue
 
                 if model_input.async_callback is not None:
@@ -2418,8 +2458,10 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     if model_input.is_prompt:
                         output.prefill_hidden_states = hidden_states
                     output.hidden_states = hidden_states
+                #logger.info(f"[STACK_TRACE] HpuModelRunner.execute_model.end_2")
                 return [output] if self.is_driver_worker else []
             else:
+                #logger.info(f"[STACK_TRACE] HpuModelRunner.execute_model.end_3")
                 return []
 
         return output if type(output) is list else [output]
