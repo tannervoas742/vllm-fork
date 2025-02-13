@@ -2261,6 +2261,10 @@ def bind_kv_cache(
         kv_cache_idx = layer_index_sorted.index(
             extract_layer_index(layer_name))
         forward_ctx = ctx[layer_name]
+        #import socket
+        #hostname = socket.gethostname()
+        #IPAddr = socket.gethostbyname(hostname)
+        #assert len(forward_ctx.kv_cache) == len(kv_cache), f"IP {IPAddr} and hostname {hostname} for layer {layer_name} mismatch: {len(forward_ctx.kv_cache)} != {len(kv_cache)}"
         assert len(forward_ctx.kv_cache) == len(kv_cache)
         for ve, ve_kv_cache in enumerate(kv_cache):
             forward_ctx.kv_cache[ve] = ve_kv_cache[kv_cache_idx]

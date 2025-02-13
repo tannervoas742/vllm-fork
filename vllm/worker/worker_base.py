@@ -84,11 +84,13 @@ class WorkerBase(ABC):
         You can stop the loop by executing a driver worker with an empty output.
         See `stop_remote_worker_execution_loop` for more details.
         """
+        #logger.info(f"[STACK_TRACE] WorkerBase.start_worker_execution_loop.start")
         with self.current_platform.inference_mode():
             while True:
                 output = self.execute_model(execute_model_req=None)
                 if output is None:
                     return None
+        #logger.info(f"[STACK_TRACE] WorkerBase.start_worker_execution_loop.end")
 
     def execute_model(
         self,
@@ -155,7 +157,10 @@ class DelegateWorkerBase(WorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> Optional[List[SamplerOutput]]:
-        return self.worker.execute_model(execute_model_req)
+        #logger.info(f"[STACK_TRACE] DelegateWorker.execute_model.start")
+        output =  self.worker.execute_model(execute_model_req)
+        #logger.info(f"[STACK_TRACE] DelegateWorker.execute_model.end")
+        return output
 
     def get_cache_block_size_bytes(self) -> int:
         return self.worker.get_cache_block_size_bytes()
@@ -373,6 +378,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
     ) -> Optional[List[SamplerOutput]]:
         """Executes at least one model step on the given sequences, unless no
         sequences are provided."""
+        #logger.info(f"[STACK_TRACE] LocalOrDistributedWorkerBase.execute_model.start")
         start_time = time.perf_counter()
 
         inputs = self.prepare_input(execute_model_req)
@@ -386,6 +392,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         # If there is no input, we don't need to execute the model.
         if worker_input.num_seq_groups == 0:
+            #logger.info(f"[STACK_TRACE] LocalOrDistributedWorkerBase.execute_model.end_1")
             return []
 
         intermediate_tensors = None
@@ -427,6 +434,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                                         model_execute_time)
 
         # output is List[SamplerOutput]
+        #logger.info(f"[STACK_TRACE] LocalOrDistributedWorkerBase.execute_model.end_2")
         return output
 
     def _execute_model_spmd(
@@ -439,6 +447,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         All workers take the same request, prepare the input and
         execute the model.
         """
+        #logger.info(f"[STACK_TRACE] LocalOrDistributedWorkerBase.execute_model_spmd.start")
         assert execute_model_req is not None, (
             "_execute_model_spmd() requires each worker to take in an "
             "ExecuteModelRequest")
@@ -452,10 +461,12 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         # If there is no input, we don't need to execute the model.
         if worker_input.num_seq_groups == 0:
+            #logger.info(f"[STACK_TRACE] LocalOrDistributedWorkerBase.execute_model_spmd.end_1")
             return []
 
         kwargs = extract_previous_hidden_states(execute_model_req)
 
+        #logger.info(f"[STACK_TRACE] LocalOrDistributedWorkerBase.execute_model_spmd.end_2")
         return self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache[worker_input.virtual_engine]

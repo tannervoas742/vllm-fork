@@ -18,7 +18,7 @@ from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.distributed import (ensure_model_parallel_initialized,
+from vllm.distributed import (ensure_model_parallel_initialized, get_pp_group,
                               init_distributed_environment)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -54,14 +54,16 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[HPUModelRunner]] = None,
     ) -> None:
+        #logger.info(f"[STACK_TRACE] HPUWorker.__init__.start")
         WorkerBase.__init__(self, vllm_config=vllm_config)
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
-        if self.is_driver_worker:
-            assert self.rank == 0, "The driver worker must have rank 0."
+        if self.parallel_config and self.is_driver_worker:
+            assert self.rank % self.parallel_config.tensor_parallel_size == 0, \
+            "The driver worker must have rank 0."
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
@@ -118,6 +120,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                 on_trace_ready=fn(torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+        #logger.info(f"[STACK_TRACE] HPUWorker.__init__.end")
 
     def full_trace_handler(self, dir_name, use_gzip=False):
 
@@ -211,7 +214,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
             self._set_env_vars()
         init_worker_distributed_environment(self.parallel_config, self.rank,
                                             self.distributed_init_method,
-                                            self.local_rank)
+                                            self.local_rank % self.parallel_config.tensor_parallel_size)
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -222,6 +225,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
     ) -> Optional[List[SamplerOutput]]:
+        #logger.info(f"[STACK_TRACE] HPUWorker.execute_model.start")
         # VLLM_HPU_LOG_STEP_GRAPH_COMPILATION     - will log graph compilations per engine step, only when there was any - highly recommended to use alongside PT_HPU_METRICS_GC_DETAILS! # noqa:E501
         # VLLM_HPU_LOG_STEP_GRAPH_COMPILATION_ALL - will log graph compilations per engine step, always, even if there were none # noqa:E501
         # VLLM_HPU_LOG_STEP_CPU_FALLBACKS         - will log cpu fallbacks per engine step, only when there was any # noqa:E501
@@ -275,11 +279,12 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                 msg = ("VLLM_HPU_STEP_CPU_FALLBACK: "
                        f"{cpu_fallback_local_metric.stats()}, {input_stats}")
                 logger.warning(msg)
-
+            #logger.info(f"[STACK_TRACE] HPUWorker.execute_model.end_1")
             return output
 
         output = LocalOrDistributedWorkerBase.execute_model(
             self, execute_model_req)
+        #logger.info(f"[STACK_TRACE] HPUWorker.execute_model.end_2")
         return output
 
     @torch.inference_mode()
@@ -300,11 +305,13 @@ class HPUWorker(LocalOrDistributedWorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
+        #logger.info(f"[STACK_TRACE] HpuWorker.determine_num_available_blocks.start")
         if is_fake_hpu():
             cache_block_size = self.get_cache_block_size_bytes()
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
             num_fake_hpu_blocks = fake_hpu_cache_alloc // cache_block_size
             self.model_runner.bucketing_ctx.num_hpu_blocks = num_fake_hpu_blocks
+            #logger.info(f"[STACK_TRACE] HpuWorker.determine_num_available_blocks.end_1")
             return num_fake_hpu_blocks, 0
         with HabanaMemoryProfiler() as m:
             self.model_runner.profile_run()
@@ -348,6 +355,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
             self.model_runner.remove_all_loras()
 
         gc.collect()
+        #logger.info(f"[STACK_TRACE] HpuWorker.determine_num_available_blocks.end_2")
         return num_hpu_blocks, num_cpu_blocks
 
     def initialize_cache(self, num_gpu_blocks: int,
@@ -356,6 +364,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
 
         This also warms up the model, which may record CUDA graphs.
         """
+        #logger.info(f"[STACK_TRACE] HPUWorker.initialize_cache.start")
         raise_if_cache_size_invalid(num_gpu_blocks,
                                     self.cache_config.block_size,
                                     self.model_config.max_model_len)
@@ -370,6 +379,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                f"took {m.get_summary_string()}")
         logger.info(msg)
         self._warm_up_model()
+        #logger.info(f"[STACK_TRACE] HPUWorker.initialize_cache.start")
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
@@ -388,11 +398,14 @@ class HPUWorker(LocalOrDistributedWorkerBase):
     def _warm_up_model(self) -> None:
         # NOTE(kzawora): We should use virtual engine index here
         # for pipeline parallelism. Using 0 for now.
+        #logger.info(f"[STACK_TRACE] HPUWorker._warm_up_model.start: {get_pp_group().rank}, {get_pp_group().local_rank}, {get_pp_group().rank_in_group}")
         assert self.hpu_cache is not None
-        self.model_runner.warmup_model(self.hpu_cache[0])
+        for ve in range(self.parallel_config.pipeline_parallel_size):
+            self.model_runner.warmup_model(self.hpu_cache[ve])
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        #logger.info(f"[STACK_TRACE] HPUWorker._warm_up_model.end")
 
     @property
     def do_metadata_broadcast(self) -> bool:
@@ -511,6 +524,10 @@ def init_worker_distributed_environment(
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
+    if parallel_config.pipeline_parallel_size > 1:
+        # torch-ccl xpu need a collective API warm up
+        # before calling send/recv API
+        get_pp_group().all_reduce(torch.zeros(1).to('hpu'))
     if torch.distributed.is_initialized():
         torch_world_size = torch.distributed.get_world_size()
         if torch_world_size != parallel_config.world_size:
