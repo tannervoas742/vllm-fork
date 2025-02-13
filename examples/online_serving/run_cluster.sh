@@ -43,7 +43,8 @@ docker run \
     --network host \
     --name node \
     --shm-size 10.24g \
-    --gpus all \
+    --runtime=habana -e HABANA_VISIBLE_DEVICES=all \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
+    -v "/nfs_home_tvoas/logs/pp_test:/workspace/logs" \
     "${ADDITIONAL_ARGS[@]}" \
     "${DOCKER_IMAGE}" -c "${RAY_START_CMD}"
