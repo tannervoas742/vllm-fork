@@ -338,7 +338,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
         # Initialize the actual workers inside worker wrapper.
         all_kwargs = []
         for rank, (node_id, _) in enumerate(worker_node_and_gpu_ids):
-            local_rank = node_workers[node_id].index(rank)
+            local_rank = node_workers[node_id].index(rank) % self.parallel_config.tensor_parallel_size
+            print(f"\n\n rank: {rank}, local_rank: {local_rank}, node worker: {node_workers[node_id]} \n\n")
             kwargs = dict(
                 vllm_config=self.vllm_config,
                 local_rank=local_rank,
@@ -348,9 +349,12 @@ class RayDistributedExecutor(DistributedExecutorBase):
                 or (rank % self.parallel_config.tensor_parallel_size == 0),
             )
             all_kwargs.append(kwargs)
+        print(f"\n\n Initializing all workers \n\n")
         self._run_workers("init_worker", all_kwargs)
-
+        print(f"\n\n All workers initialized \n\n")
+        print(f"\n\n Initializing all devices \n\n")
         self._run_workers("init_device")
+        print(f"\n\n All devices initialized \n\n")
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)

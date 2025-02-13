@@ -56,13 +56,13 @@ class HPUWorker(LocalOrDistributedWorkerBase):
     ) -> None:
         WorkerBase.__init__(self, vllm_config=vllm_config)
         self.parallel_config.rank = rank
-        self.local_rank = local_rank
+        self.local_rank = local_rank % 8
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
-        print(f"Here is my rank: {self.rank}, am I a driver worker? {self.is_driver_worker}")
-        if self.is_driver_worker:
-            assert self.rank == 0, "The driver worker must have rank 0."
+        print(f"\n\nHere is my rank: {self.rank}, am I a driver worker? {self.is_driver_worker}\n\n")
+        #if self.is_driver_worker:
+        #    assert self.rank == 0, "The driver worker must have rank 0."
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
@@ -79,7 +79,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
             or (speculative_config.draft_model_config.hf_config.model_type
                 not in ["medusa", "mlp_speculator", "eagle"]) \
                     else {"return_hidden_states": True}
-
+        print(f"\n\n Setting up HPU Model Runner: {self.rank} \n\n")
         is_encoder_decoder_model = self._is_encoder_decoder_model()
         ModelRunnerClass: Type[HPUModelRunnerBase] = HPUModelRunner
         if is_encoder_decoder_model:
@@ -92,6 +92,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         )
         if model_runner_cls is not None:
             self.model_runner = model_runner_cls(self.model_runner)
+        print(f"\n\n Finished setting up HPU Model Runner: {self.rank} \n\n")
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: List[HPUCacheEngine]
@@ -119,6 +120,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                 on_trace_ready=fn(torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+        print(f"\n\n Finished initializing HPU Worker: {self.rank} \n\n")
 
     def full_trace_handler(self, dir_name, use_gzip=False):
 
@@ -199,8 +201,9 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         os.environ["RANK"] = str(self.rank)
 
     def init_device(self) -> None:
+        print(f"\n\n Initializing device for rank {self.rank} and local rank {self.local_rank} \n\n")
         if self.device_config.device.type == "hpu":
-            self.device = torch.device("hpu")
+            self.device = torch.device(f"hpu:{self.local_rank}")
             torch.hpu.set_device(self.device)
         elif self.device_config.device_type == "cpu":
             self.device = torch.device("cpu")
@@ -213,6 +216,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         init_worker_distributed_environment(self.parallel_config, self.rank,
                                             self.distributed_init_method,
                                             self.local_rank)
+        print(f"\n\n Finished initializing device for rank {self.rank} \n\n")
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -503,15 +507,17 @@ def init_worker_distributed_environment(
 ) -> None:
     """Initialize the distributed environment."""
     backend = hpu_backend_string()
+    print(f"\n\n Initializing distributed environment for rank {rank} and local rank {local_rank} \n\n")
     init_distributed_environment(parallel_config.world_size,
                                  rank,
                                  distributed_init_method,
                                  local_rank,
                                  backend=backend)
-
+    print(f"\n\n Ensuring model parallel initialized for rank {rank} \n\n")
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
+    print(f"\n\n Handling Torch Distributed for rank {rank} \n\n")
     if torch.distributed.is_initialized():
         torch_world_size = torch.distributed.get_world_size()
         if torch_world_size != parallel_config.world_size:
@@ -532,11 +538,14 @@ def init_worker_distributed_environment(
             init_method=distributed_init_method,
         )
 
+    print(f"\n\n Checking model parallel initialization for rank {rank} \n\n")
     # A small all_reduce for warmup & checking conformance.
     device = hpu_device_string()
+    device = torch.device(f"hpu:{local_rank}")
     dummy_tensor_hpu = torch.ones(1).to(device)
     torch.distributed.all_reduce(dummy_tensor_hpu)
     assert dummy_tensor_hpu.item() == parallel_config.world_size
+    print(f"\n\n Ensuring model parallel initialized (again) for rank {rank} \n\n")
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
